@@ -1,7 +1,7 @@
-// Lanterns fight in three channels. Every card is a lantern creature; its rule
-// resolves when it is played, before the creatures attack at the end of a turn.
+// Lanterns fight in three channels. Units remain in their lanes; spells resolve
+// against a chosen channel and then go to the discard pile.
 const LANES = 3;
-const MAX_LIFE = 24;
+const MAX_LIFE = 20;
 const MAX_ENERGY = 8;
 const MAX_HAND = 5;
 const LANE_NAMES = ['left', 'middle', 'right'];
@@ -23,12 +23,17 @@ const CARDS = [
   { name: 'Mirrorling', suit: 'star', cost: 2, attack: 1, health: 2, kind: 'Mirror', effect: 'copy', rule: 'Copy the ATK and max HP of your strongest ally.' },
   { name: 'Astral Weaver', suit: 'star', cost: 3, attack: 2, health: 4, kind: 'Weaver', effect: 'after-moth', rule: 'If your last card was a Moth, gain +2 ATK.' },
   { name: 'Starforged Leviathan', suit: 'star', cost: 4, attack: 4, health: 4, kind: 'Leviathan', effect: 'starlight', rule: 'Gain +1/+1 for each other Star ally.' },
+  { name: 'Searing Surge', suit: 'ember', cost: 2, attack: 0, health: 0, kind: 'Surge', type: 'spell', effect: 'spell-flame', rule: 'Deal 3 to an enemy here, or 2 to its lantern.' },
+  { name: 'Pearl Tide', suit: 'tide', cost: 2, attack: 0, health: 0, kind: 'Tidecraft', type: 'spell', effect: 'spell-mend', rule: 'Restore 3 HP to an ally here, or 2 to your lantern.' },
+  { name: 'Verdant Gift', suit: 'grove', cost: 2, attack: 0, health: 0, kind: 'Blessing', type: 'spell', effect: 'spell-bless', rule: 'Give an ally in this lane +2 ATK and +2 HP.' },
+  { name: 'Astral Echo', suit: 'star', cost: 2, attack: 0, health: 0, kind: 'Echo', type: 'spell', effect: 'spell-echo', rule: 'Copy the base card of an ally here to your hand.' },
 ];
 
 const CARD_BY_KIND = Object.fromEntries(CARDS.map(card => [card.kind, card]));
 
 function freshCard(kind) {
-  return { ...CARD_BY_KIND[kind] };
+  const card = CARD_BY_KIND[kind];
+  return { ...card, type: card.type || 'unit' };
 }
 
 function note(game, message) {
@@ -61,12 +66,14 @@ function makePlayer(game) {
   }
   shuffle(game, deck);
 
-  // Both captains open with an affordable same-suit pair. The remaining
-  // cards and the pair's suit come from the shuffled deck.
-  const firstIndex = deck.findIndex(card => card.cost === 1);
+  // Both captains open with an affordable same-suit unit pair and a spell.
+  // The pair's suit and the remaining cards come from the shuffled deck.
+  const firstIndex = deck.findIndex(card => card.cost === 1 && card.type === 'unit');
   const first = deck.splice(firstIndex, 1)[0];
-  const secondIndex = deck.findIndex(card => card.suit === first.suit && card.cost === 2);
-  const hand = [first, deck.splice(secondIndex, 1)[0]];
+  const secondIndex = deck.findIndex(card => card.suit === first.suit && card.cost === 2 && card.type === 'unit');
+  const second = deck.splice(secondIndex, 1)[0];
+  const spellIndex = deck.findIndex(card => card.type === 'spell');
+  const hand = [first, second, deck.splice(spellIndex, 1)[0]];
   while (hand.length < MAX_HAND) hand.push(deck.pop());
   return { life: MAX_LIFE, energy: 3, maxEnergy: 3, hand, deck, discard: [], lanes: Array(LANES).fill(null) };
 }
@@ -213,32 +220,91 @@ function resolveEffect(game, side, lane, unit) {
   }
 }
 
+function canPlayInLane(player, card, lane) {
+  return card.type !== 'spell' ||
+    (card.effect !== 'spell-bless' && card.effect !== 'spell-echo') ||
+    !!player.lanes[lane];
+}
+
+function resolveSpell(game, side, lane, card, harmony) {
+  const player = game.players[side];
+  const enemy = game.players[1 - side];
+  const ally = player.lanes[lane];
+  const target = enemy.lanes[lane];
+  const bonus = harmony ? 1 : 0;
+  switch (card.effect) {
+    case 'spell-flame':
+      if (target) {
+        note(game, `${card.name} deals ${3 + bonus} damage to ${target.name}.`);
+        damageUnit(game, 1 - side, lane, 3 + bonus);
+      } else {
+        enemy.life = Math.max(0, enemy.life - 2 - bonus);
+        note(game, `${card.name} deals ${2 + bonus} damage to the opposing lantern.`);
+      }
+      break;
+    case 'spell-mend':
+      if (ally) {
+        const restored = Math.min(3 + bonus, ally.maxHealth - ally.health);
+        ally.health += restored;
+        note(game, `${card.name} restores ${restored} health to ${ally.name}.`);
+      } else {
+        const restored = Math.min(2 + bonus, MAX_LIFE - player.life);
+        player.life += restored;
+        note(game, `${card.name} restores ${restored} lantern health.`);
+      }
+      break;
+    case 'spell-bless':
+      ally.attack += 2 + bonus;
+      addHealth(ally, 2 + bonus);
+      note(game, `${card.name} gives ${ally.name} +${2 + bonus}/+${2 + bonus}.`);
+      break;
+    case 'spell-echo': {
+      const copies = Math.min(harmony ? 2 : 1, MAX_HAND - player.hand.length);
+      for (let i = 0; i < copies; i++) player.hand.push(freshCard(ally.kind));
+      note(game, `${card.name} copies ${ally.name} to hand${copies > 1 ? ' twice' : ''}.`);
+      break;
+    }
+  }
+}
+
 export function playCard(game, side, index, lane) {
   if (game.result || (side !== 0 && side !== 1) || game.active !== side ||
       !Number.isInteger(index) || !Number.isInteger(lane) || lane < 0 || lane >= LANES) return false;
   const player = game.players[side];
   const card = player.hand[index];
-  if (!card || card.cost > player.energy) return false;
+  if (!card || card.cost > player.energy || !canPlayInLane(player, card, lane)) return false;
 
+  const count = (game._suits[card.suit] || 0) + 1;
+  const harmony = count % 2 === 0;
   player.hand.splice(index, 1);
   player.energy -= card.cost;
-  if (player.lanes[lane]) {
-    note(game, `${player.lanes[lane].name} makes way in the ${LANE_NAMES[lane]} channel.`);
-    discardUnit(player, lane);
+  if (card.type === 'spell') {
+    note(game, `${side === 0 ? 'You cast' : 'The rival casts'} ${card.name} in the ${LANE_NAMES[lane]} channel.`);
+    resolveSpell(game, side, lane, card, harmony);
+    player.discard.push(card);
+  } else {
+    if (player.lanes[lane]) {
+      note(game, `${player.lanes[lane].name} makes way in the ${LANE_NAMES[lane]} channel.`);
+      discardUnit(player, lane);
+    }
+    const unit = { ...card, maxHealth: card.health };
+    player.lanes[lane] = unit;
+    note(game, `${side === 0 ? 'You summon' : 'The rival summons'} ${unit.name} in the ${LANE_NAMES[lane]} channel.`);
+    resolveEffect(game, side, lane, unit);
+    if (harmony) {
+      unit.attack++;
+      addHealth(unit, 1);
+    }
   }
-  const unit = { ...card, maxHealth: card.health };
-  player.lanes[lane] = unit;
-  note(game, `${side === 0 ? 'You summon' : 'The rival summons'} ${unit.name} in the ${LANE_NAMES[lane]} channel.`);
-  resolveEffect(game, side, lane, unit);
 
-  // Each pair of a suit played during this turn gives the second card +1/+1.
-  const count = (game._suits[card.suit] || 0) + 1;
+  // Each same-suit pair strengthens the second play, whether unit or spell.
   game._suits[card.suit] = count;
-  if (count % 2 === 0) {
-    unit.attack++;
-    addHealth(unit, 1);
+  if (harmony) {
     game.combo++;
-    note(game, `${card.suit[0].toUpperCase() + card.suit.slice(1)} harmony! ${unit.name} gains +1/+1.`);
+    const suit = card.suit[0].toUpperCase() + card.suit.slice(1);
+    note(game, card.type === 'spell'
+      ? `${suit} harmony strengthens ${card.name}!`
+      : `${suit} harmony! ${card.name} gains +1/+1.`);
   }
   game._lastKind = card.kind;
   finishIfNeeded(game);
@@ -278,11 +344,53 @@ function startTurn(game, side) {
   note(game, side === 0 ? `Turn ${game.turn}: your lanterns are ready.` : 'The rival gathers light.');
 }
 
+function scoreSpell(game, side, card, lane, suits) {
+  const player = game.players[side];
+  if (!canPlayInLane(player, card, lane)) return -Infinity;
+  const enemy = game.players[1 - side];
+  const ally = player.lanes[lane];
+  const target = enemy.lanes[lane];
+  const bonus = (suits[card.suit] || 0) % 2;
+  const cost = card.cost * 0.45;
+  switch (card.effect) {
+    case 'spell-flame': {
+      const damage = (target ? 3 : 2) + bonus;
+      if (!target) return damage * 1.8 - cost + (enemy.life <= damage ? 100 : 0);
+      let score = Math.min(damage, target.health) * 1.5 - cost;
+      if (target.health <= damage) {
+        score += 3;
+        if (ally) score += ally.attack * 1.5 + (enemy.life <= ally.attack ? 100 : 0);
+      }
+      return score;
+    }
+    case 'spell-mend': {
+      const healed = ally
+        ? Math.min(3 + bonus, ally.maxHealth - ally.health)
+        : Math.min(2 + bonus, MAX_LIFE - player.life);
+      return healed * 1.1 - cost;
+    }
+    case 'spell-bless': {
+      const gain = 2 + bonus;
+      const lethal = !target && ally.attack + gain >= enemy.life;
+      return gain * 2.7 - cost + (lethal ? 100 : 0);
+    }
+    case 'spell-echo': {
+      const base = CARD_BY_KIND[ally.kind];
+      const roomAfterCast = MAX_HAND - player.hand.length + 1;
+      const copies = Math.min(1 + bonus, Math.max(1, roomAfterCast));
+      return copies * (2 + base.attack * 0.4 + base.health * 0.2) - cost;
+    }
+    default:
+      return -Infinity;
+  }
+}
+
 // Score every affordable card and channel, including what would be displaced.
 // This makes the rival develop open lanes, finish exposed lanterns and avoid
 // trading away a stronger creature just because it still has energy.
 function scorePlay(game, side, card, lane, suits, lastKind) {
   const player = game.players[side];
+  if (card.type === 'spell') return scoreSpell(game, side, card, lane, suits);
   const enemy = game.players[1 - side];
   const previous = player.lanes[lane];
   const target = enemy.lanes[lane];
@@ -381,8 +489,8 @@ export function endTurn(game) {
 export function setupShot(name) {
   const game = makeGame(0x1a47e2d5);
   const handKinds = [
-    ['Diver', 'Ray', 'Warden', 'Moth', 'Bloom'],
-    ['Scout', 'Caller', 'Diver', 'Moth', 'Leviathan'],
+    ['Diver', 'Ray', 'Warden', 'Echo', 'Bloom'],
+    ['Scout', 'Surge', 'Diver', 'Moth', 'Leviathan'],
   ];
   const laneKinds = [
     [['Strider', 2, 3], ['Ray', 3, 2], ['Mirror', 3, 3]],
@@ -409,7 +517,12 @@ export function setupShot(name) {
   game._lastKind = game.combo ? 'Ray' : null;
   game.log = game.combo
     ? ['The lanterns gather in the deep.', 'Ember harmony! Cinder Ray gains +1/+1.']
-    : ['The lanterns gather in the deep.', 'Choose a card and a channel to summon it.'];
+    : ['The lanterns gather in the deep.', 'Choose a card and a channel to summon or cast.'];
+  if (game.combo) game.players[0].lanes[1].maxHealth = 4;
+  if (name === 'combo') {
+    game.players[1].lanes[0].health = 2;
+    game.log.push('Kelp Strider strikes Moss Guardian for 2.');
+  }
   updateIntent(game);
   if (name === 'victory') {
     game.players[1].life = 0;
